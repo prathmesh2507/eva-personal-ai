@@ -7,7 +7,7 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-
+#
 @app.route("/system", methods=["POST"])
 def system_control():
     data = request.json
