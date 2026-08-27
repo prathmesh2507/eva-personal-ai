@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -34,6 +35,13 @@ REQUIRED_COLUMNS = [
 ]
 PERIOD_OPTIONS = ["All years", "2020s", "2010s", "2000s", "1990s", "Older"]
 SORT_OPTIONS = ["Similarity", "Rating", "Popularity", "Release date"]
+
+# TMDB is used purely as a presentation/enrichment layer for real poster
+# artwork. It never feeds into the TF-IDF / cosine-similarity recommender.
+TMDB_API_BASE = "https://api.themoviedb.org/3"
+TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
+TMDB_REQUEST_TIMEOUT = 5  # seconds — never let a poster fetch hang the app
+TMDB_POSTER_CACHE_TTL = 60 * 60 * 24  # 24h
 
 # Duotone gradient palette used for the placeholder "poster" tiles.
 # No poster URLs exist in the dataset, so cards use generated gradients
@@ -217,9 +225,17 @@ def inject_css() -> None:
             box-shadow: 0 14px 34px rgba(0,0,0,0.45), 0 0 0 1px rgba(230,57,95,0.12);
         }
         .card-poster{
-            height:118px; position:relative;
+            aspect-ratio: 2 / 3; position:relative;
             display:flex; align-items:center; justify-content:center;
+            overflow:hidden;
         }
+        .card-poster img{
+            position:absolute; inset:0;
+            width:100%; height:100%;
+            object-fit:cover; object-position:center top;
+            display:block;
+        }
+        .card-poster .poster-link{ position:absolute; inset:0; display:block; }
         .card-poster .initials{
             font-family:'Bebas Neue', sans-serif;
             font-size:2.4rem; color: rgba(255,255,255,0.92);
@@ -593,11 +609,227 @@ def render_html(html: str) -> None:
 
 
 # ============================================================================
+# TMDB POSTER INTEGRATION
+# ============================================================================
+#
+# This section is a presentation/enrichment layer ONLY. It never touches
+# the TF-IDF vectorizer, the cosine-similarity computation, or the ranking
+# logic above — those remain driven purely by `movies.csv`. If TMDB is
+# unreachable, misconfigured, rate-limited, or simply has no match for a
+# given movie, every function here degrades to returning None, and the UI
+# falls back to the original gradient + initials placeholder.
+#
+# The dataset's `id` column is NOT assumed to be a TMDB ID. `get_tmdb_movie`
+# tries a direct-by-ID lookup first (cheap, exact when it works) but only
+# trusts it if the returned title is actually a plausible match for the
+# row; otherwise it falls back to a title + release-year search. This
+# protects against datasets where `id` is a different source's ID (e.g. a
+# Kaggle/IMDb-style ID) as well as remakes, duplicate titles, and sequels
+# sharing a name (e.g. "Batman" 1989 vs. "Batman" 2022 vs. "Batman Begins").
+
+def get_tmdb_api_key() -> Optional[str]:
+    """
+    Safely read TMDB_API_KEY from Streamlit secrets.
+
+    Never raises: returns None if `.streamlit/secrets.toml` doesn't exist,
+    the key isn't set, or secrets access fails for any other reason.
+    Callers must treat a None key as "TMDB is unavailable" and fall back.
+    """
+    try:
+        key = st.secrets.get("TMDB_API_KEY")
+    except Exception:  # noqa: BLE001 - e.g. no secrets.toml present at all
+        return None
+    key = str(key).strip() if key else ""
+    return key or None
+
+
+def _tmdb_get(path: str, params: dict) -> Optional[dict]:
+    """
+    Low-level TMDB GET request. Never raises and never hangs indefinitely.
+
+    Returns None on: missing/invalid key, timeout, connection error, any
+    non-2xx HTTP status (including 401 invalid-key and 429 rate-limited),
+    or a malformed/non-JSON response.
+    """
+    api_key = get_tmdb_api_key()
+    if not api_key:
+        return None
+    try:
+        response = requests.get(
+            f"{TMDB_API_BASE}{path}",
+            params={**params, "api_key": api_key},
+            timeout=TMDB_REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) else None
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+        return None
+    except requests.exceptions.RequestException:
+        return None  # covers 401 / 404 / 429 / 5xx via raise_for_status()
+    except ValueError:
+        return None  # malformed JSON
+
+
+@st.cache_data(show_spinner=False, ttl=TMDB_POSTER_CACHE_TTL)
+def _tmdb_lookup_by_id(tmdb_id: int) -> Optional[dict]:
+    """Direct TMDB movie lookup by ID. Cached per ID for 24h."""
+    return _tmdb_get(f"/movie/{int(tmdb_id)}", {})
+
+
+@st.cache_data(show_spinner=False, ttl=TMDB_POSTER_CACHE_TTL)
+def _tmdb_search_by_title(title: str, year: Optional[int]) -> Optional[dict]:
+    """
+    Search TMDB by title (+ year when known) and pick the best candidate.
+
+    Candidates are ranked by (1) title similarity, (2) exact release-year
+    match, and (3) popularity only as a final tie-breaker — so a query for
+    "Batman" (1989) won't resolve to "Batman" (2022) or an unrelated
+    similarly-named film just because it's more popular today.
+    """
+    params = {"query": title, "include_adult": "false"}
+    if year:
+        params["year"] = int(year)
+    data = _tmdb_get("/search/movie", params)
+    results = (data or {}).get("results") or []
+
+    if not results and year:
+        # TMDB's `year` param can be overly strict (release vs. wide-release
+        # dates); retry once without it before giving up.
+        data = _tmdb_get("/search/movie", {"query": title, "include_adult": "false"})
+        results = (data or {}).get("results") or []
+
+    if not results:
+        return None
+
+    def _score(candidate: dict) -> Tuple[float, float, float]:
+        cand_title = str(candidate.get("title") or candidate.get("original_title") or "")
+        title_sim = difflib.SequenceMatcher(None, title.lower(), cand_title.lower()).ratio()
+        cand_year = None
+        release_date = candidate.get("release_date") or ""
+        if len(release_date) >= 4 and release_date[:4].isdigit():
+            cand_year = int(release_date[:4])
+        year_match = 1.0 if (year and cand_year == year) else 0.0
+        popularity = float(candidate.get("popularity") or 0.0)
+        return (title_sim, year_match, popularity)
+
+    return max(results, key=_score)
+
+
+def get_tmdb_movie(row: pd.Series) -> Optional[dict]:
+    """
+    Resolve the best-matching TMDB movie record for a dataset row.
+
+    Tries an ID-based lookup first, but only trusts it if the resulting
+    title is plausibly the same movie; otherwise falls back to a
+    title + release-year search.
+    """
+    title = str(row.get("title") or "").strip()
+    if not title:
+        return None
+
+    year_val = row.get("release_year")
+    year = int(year_val) if pd.notna(year_val) else None
+
+    raw_id = row.get("id")
+    if pd.notna(raw_id):
+        try:
+            tmdb_id = int(float(raw_id))
+        except (TypeError, ValueError):
+            tmdb_id = None
+        if tmdb_id and tmdb_id > 0:
+            candidate = _tmdb_lookup_by_id(tmdb_id)
+            if candidate:
+                cand_title = str(candidate.get("title") or candidate.get("original_title") or "")
+                title_sim = difflib.SequenceMatcher(None, title.lower(), cand_title.lower()).ratio()
+                if title_sim >= 0.6:  # guards against `id` not being a TMDB ID
+                    return candidate
+
+    return _tmdb_search_by_title(title, year)
+
+
+def build_poster_url(poster_path: Optional[str]) -> Optional[str]:
+    """TMDB image CDN URL for a poster path, or None if no path exists."""
+    if not poster_path:
+        return None
+    return f"{TMDB_IMAGE_BASE}{poster_path}"
+
+
+def get_poster_and_link(row: pd.Series) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Returns (poster_url, tmdb_page_url) for a row, or (None, None) if TMDB
+    is unavailable, unconfigured, or no confident match/poster exists.
+    This is the only entry point UI code should call for poster data.
+    """
+    if not get_tmdb_api_key():
+        return None, None
+    movie = get_tmdb_movie(row)
+    if not movie:
+        return None, None
+    poster_url = build_poster_url(movie.get("poster_path"))
+    if not poster_url:
+        return None, None
+    tmdb_id = movie.get("id")
+    page_url = f"https://www.themoviedb.org/movie/{tmdb_id}" if tmdb_id else None
+    return poster_url, page_url
+
+
+def _poster_fragment_card(row: pd.Series) -> str:
+    """
+    Poster markup for a grid card: a real TMDB poster (linked to its TMDB
+    page when available) if one can be resolved, otherwise the existing
+    gradient + initials placeholder. Fills the `.card-poster` container.
+    """
+    poster_url, page_url = get_poster_and_link(row)
+    if poster_url:
+        img_html = f'<img src="{esc(poster_url)}" alt="{esc(row["title"])} poster" loading="lazy">'
+        if page_url:
+            return (
+                f'<a class="poster-link" href="{esc(page_url)}" target="_blank" '
+                f'rel="noopener noreferrer">{img_html}</a>'
+            )
+        return img_html
+
+    g1, g2 = get_gradient(row["title"])
+    return (
+        f'<div style="position:absolute;inset:0;background:linear-gradient(135deg,{g1},{g2});'
+        f'display:flex;align-items:center;justify-content:center;">'
+        f'<div class="initials">{esc(get_initials(row["title"]))}</div></div>'
+    )
+
+
+def _poster_fragment_detail(row: pd.Series) -> str:
+    """Poster markup for the selected-movie detail card's fixed-size box."""
+    poster_url, page_url = get_poster_and_link(row)
+    if poster_url:
+        img_html = (
+            f'<img src="{esc(poster_url)}" alt="{esc(row["title"])} poster" loading="lazy" '
+            f'style="width:100%;height:100%;object-fit:cover;object-position:center top;'
+            f'display:block;border-radius:12px;">'
+        )
+        if page_url:
+            return (
+                f'<a href="{esc(page_url)}" target="_blank" rel="noopener noreferrer" '
+                f'style="display:block;width:100%;height:100%;">{img_html}</a>'
+            )
+        return img_html
+
+    g1, g2 = get_gradient(row["title"])
+    return (
+        f'<div style="width:100%;height:100%;border-radius:12px;'
+        f'background:linear-gradient(135deg,{g1},{g2});'
+        f'display:flex;align-items:center;justify-content:center;">'
+        f"<span style=\"font-family:'Bebas Neue',sans-serif;font-size:2.4rem;"
+        f'color:rgba(255,255,255,0.9);">{esc(get_initials(row["title"]))}</span></div>'
+    )
+
+
+# ============================================================================
 # UI COMPONENTS
 # ============================================================================
 
 def render_movie_card_html(row: pd.Series, rank: Optional[int] = None, show_similarity: bool = False) -> str:
-    g1, g2 = get_gradient(row["title"])
+    poster_html = _poster_fragment_card(row)
     rank_html = f'<div class="rank-badge">#{rank}</div>' if rank else ""
     rating = row.get("vote_average", 0) or 0
     year = fmt_year(row)
@@ -611,10 +843,10 @@ def render_movie_card_html(row: pd.Series, rank: Optional[int] = None, show_simi
 
     return f"""
     <div class="movie-card">
-        <div class="card-poster" style="background:linear-gradient(135deg,{g1},{g2});">
+        <div class="card-poster">
+            {poster_html}
             {rank_html}
             <div class="rating-badge">★ {rating:.1f}</div>
-            <div class="initials">{esc(get_initials(row['title']))}</div>
         </div>
         <div class="card-body">
             <div class="card-title">{esc(row['title'])}</div>
@@ -641,18 +873,14 @@ def render_movie_grid(rows: pd.DataFrame, ranked: bool = False, show_similarity:
 
 
 def render_movie_details(row: pd.Series) -> None:
-    g1, g2 = get_gradient(row["title"])
+    poster_html = _poster_fragment_detail(row)
     render_html(
         f"""
         <div class="detail-card">
             <div style="display:flex; gap:1.4rem; align-items:flex-start; flex-wrap:wrap;">
                 <div style="width:110px; height:150px; border-radius:12px; flex-shrink:0;
-                            background:linear-gradient(135deg,{g1},{g2});
-                            display:flex; align-items:center; justify-content:center;
-                            border:1px solid var(--border);">
-                    <span style="font-family:'Bebas Neue',sans-serif; font-size:2.4rem; color:rgba(255,255,255,0.9);">
-                        {esc(get_initials(row['title']))}
-                    </span>
+                            overflow:hidden; border:1px solid var(--border);">
+                    {poster_html}
                 </div>
                 <div style="flex:1; min-width:240px;">
                     <div class="detail-title">{esc(row['title'])}</div>
@@ -1134,6 +1362,8 @@ def main() -> None:
 
     with st.sidebar:
         page = render_sidebar(df)
+        if not get_tmdb_api_key():
+            st.caption("🎬 Add `TMDB_API_KEY` in Streamlit secrets to show real posters.")
 
     if page == "Home":
         render_home(df)
